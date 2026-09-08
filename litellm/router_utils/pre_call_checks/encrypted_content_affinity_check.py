@@ -226,9 +226,13 @@ class EncryptedContentAffinityCheck(CustomLogger):
         If the request ``input`` contains litellm-encoded item IDs, decode the
         embedded ``model_id`` and pin the request to that deployment. Raises
         ``RateLimitError`` / ``ServiceUnavailableError`` / ``BadRequestError``
-        when the originating deployment is unavailable and no encryption-boundary
-        peer exists, rather than dispatching a doomed request to a non-peer
-        deployment. The 429/503 split mirrors the originating cooldown's status:
+        when the originating deployment is unavailable within its own model group
+        and no encryption-boundary peer exists, rather than dispatching a doomed
+        request to a non-peer deployment. When the router is sending the follow-up
+        to a different model group (an auto-router tier change, or a model switch
+        with no peer), the encrypted reasoning is stripped and the request
+        dispatches with its readable history instead. The 429/503 split mirrors
+        the originating cooldown's status:
         a 429-induced cooldown surfaces as 429 (with ``Retry-After`` set to the
         remaining cooldown window) so OpenAI-compatible clients back off and
         retry after the deployment is eligible again.
@@ -284,6 +288,26 @@ class EncryptedContentAffinityCheck(CustomLogger):
             )
             request_kwargs["_encrypted_content_affinity_pinned"] = True
             return boundary_matches
+
+        # A follow-up routed to a model group that does not contain the deployment which minted the
+        # reasoning (an auto-router tier change, or a client switching `model`) can never decrypt it,
+        # and no peer shares the boundary. Membership is tested by deployment id, not by model-group
+        # name, so an alias or provider-qualified spelling of the same group is not mistaken for a
+        # tier change. Strip the encrypted reasoning, keep the readable history, and dispatch to the
+        # routed group instead of failing. Same-group unavailability falls through to the fail-fast
+        # below, preserving the cooldown contract.
+        if originating is not None and self.router is not None:
+            routed_group_model_ids: Final = frozenset(str(mid) for mid in self.router.get_model_ids(model_name=model))
+            if str(model_id) not in routed_group_model_ids:
+                verbose_router_logger.debug(
+                    "EncryptedContentAffinityCheck: model_id=%s (group %s) is not a member of the routed group %s; "
+                    "forwarding without its encrypted reasoning",
+                    model_id,
+                    originating.model_name,
+                    model,
+                )
+                ResponsesAPIRequestUtils.strip_encrypted_reasoning_from_input(request_input)
+                return typed_healthy_deployments
 
         # Dispatching to a non-peer would guarantee an upstream
         # `invalid_encrypted_content` 400, so fail fast with a clearer error.
