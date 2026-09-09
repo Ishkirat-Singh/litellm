@@ -15,6 +15,8 @@ import yaml
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+from litellm.proxy._experimental.mcp_server.tool_search import handle_mcp_proxy_tool
+from litellm.proxy._types import LiteLLM_ObjectPermissionTable, UserAPIKeyAuth
 from litellm.proxy.proxy_server import (
     app as proxy_app,
     cleanup_router_config_variables,
@@ -139,7 +141,8 @@ def proxy_server_url(tmp_path_factory: pytest.TempPathFactory, math_streamable_h
     config_dir = tmp_path_factory.mktemp("mcp_e2e")
     config_path = config_dir / "config.yaml"
     config = yaml.safe_load(CONFIG_TEMPLATE_PATH.read_text())
-    config["mcp_servers"]["math_streamable_http"]["url"] = f"{math_streamable_http_server}/mcp"
+    for name in ("math_streamable_http", "math_restricted"):
+        config["mcp_servers"][name]["url"] = f"{math_streamable_http_server}/mcp"
     config_path.write_text(yaml.safe_dump(config))
 
     server_url, server, thread, sock = _start_proxy_server(str(config_path))
@@ -384,6 +387,12 @@ class TestProxyMcpSchemaDiscoveryMode:
                     stale = await session.call_tool("get_tool_schema", arguments={"tool_id": "0" * 32})
                     assert stale.isError is True and "unauthorized tool_id" in stale.content[0].text
 
+                    for not_an_object in ("wrong", False):
+                        refused_args = await session.call_tool(
+                            "call_tool", arguments={"tool_id": tool_id, "arguments": not_an_object}
+                        )
+                        assert refused_args.isError is True and "object" in refused_args.content[0].text
+
                     direct = await session.call_tool("math_stdio-add", arguments={"a": 1, "b": 2})
                     assert direct.isError is True and "unavailable on /mcp/proxy" in direct.content[0].text
 
@@ -391,3 +400,68 @@ class TestProxyMcpSchemaDiscoveryMode:
                         with pytest.raises(McpError) as refused:
                             await operation()
                         assert refused.value.error.code == METHOD_NOT_FOUND
+
+
+def _auth(**object_permission: object) -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        api_key="sk-scope",
+        object_permission=LiteLLM_ObjectPermissionTable(object_permission_id="scope", **object_permission),
+    )
+
+
+async def _search(auth: UserAPIKeyAuth, query: str) -> dict[str, str]:
+    hits = _payload(await handle_mcp_proxy_tool("search_tools", {"query": query}, auth))
+    return {hit["name"]: hit["tool_id"] for hit in hits}
+
+
+async def _call(auth: UserAPIKeyAuth, tool_id: str, a: int, b: int) -> typing.Any:
+    return await handle_mcp_proxy_tool("call_tool", {"tool_id": tool_id, "arguments": {"a": a, "b": b}}, auth)
+
+
+@pytest.mark.usefixtures("proxy_server_url")
+class TestProxyMcpAuthorizationScope:
+    """The running proxy's real registry, resolver and upstreams; the caller's UserAPIKeyAuth is the
+    only injected input. math_stdio and math_streamable_http are allow_all_keys floors, math_restricted
+    is reachable only through an explicit grant."""
+
+    @pytest.mark.asyncio
+    async def test_server_grant_bounds_search_and_blocks_foreign_ids(self) -> None:
+        granted = _auth(mcp_servers=["math_restricted"])
+        ungranted = _auth(mcp_servers=["math_stdio"])
+
+        restricted_id = (await _search(granted, "add"))["math_restricted-add"]
+        assert "math_restricted-add" not in await _search(ungranted, "add")
+
+        schema = await handle_mcp_proxy_tool("get_tool_schema", {"tool_id": restricted_id}, ungranted)
+        called = await _call(ungranted, restricted_id, 1, 2)
+        assert schema.isError is True and "unauthorized tool_id" in schema.content[0].text
+        assert called.isError is True and called.content[0].text != "3"
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_servers_sentinel_hides_every_tool(self) -> None:
+        assert await _search(_auth(mcp_servers=["no-mcp-servers"]), "add") == {}
+
+    @pytest.mark.asyncio
+    async def test_tool_grant_hides_ungranted_tools_and_blocks_their_ids(self) -> None:
+        multiply_id = (await _search(_auth(mcp_servers=["math_stdio"]), "multiply"))["math_stdio-multiply"]
+        add_only = _auth(mcp_servers=["math_stdio"], mcp_tool_permissions={"math_stdio": ["add"]})
+
+        assert "math_stdio-add" in await _search(add_only, "add")
+        assert "math_stdio-multiply" not in await _search(add_only, "multiply")
+        blocked = await _call(add_only, multiply_id, 2, 3)
+        assert blocked.isError is True and blocked.content[0].text != "6"
+
+    @pytest.mark.asyncio
+    async def test_same_named_tools_keep_distinct_ids_and_reach_their_own_upstream(self) -> None:
+        auth = _auth(mcp_servers=["math_restricted"])
+        ids = await _search(auth, "add")
+        assert {"math_stdio-add", "math_streamable_http-add", "math_restricted-add"} <= set(ids)
+        assert len({ids[name] for name in ids}) == len(ids)
+
+        results = [
+            await _call(auth, ids["math_stdio-add"], 3, 4),
+            await _call(auth, ids["math_streamable_http-add"], 5, 6),
+            await _call(auth, ids["math_restricted-add"], 7, 8),
+        ]
+        assert [result.content[0].text for result in results] == ["7", "11", "15"]
+        assert all(result.isError is False for result in results)
